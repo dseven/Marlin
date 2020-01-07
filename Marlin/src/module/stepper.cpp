@@ -98,7 +98,7 @@ Stepper stepper; // Singleton
 #include "../core/language.h"
 #include "../gcode/queue.h"
 #include "../sd/cardreader.h"
-#include "../Marlin.h"
+#include "../MarlinCore.h"
 #include "../HAL/shared/Delay.h"
 
 #if MB(ALLIGATOR)
@@ -338,6 +338,13 @@ xyze_int8_t Stepper::count_direction{0};
 #if DISABLED(MIXING_EXTRUDER)
   #define E_APPLY_STEP(v,Q) E_STEP_WRITE(stepper_extruder, v)
 #endif
+
+#define CYCLES_TO_NS(CYC) (1000UL * (CYC) / ((F_CPU) / 1000000))
+constexpr uint32_t NS_PER_PULSE_TIMER_TICK = 1000000000UL / (STEPPER_TIMER_RATE);
+
+// Round up when converting from ns to timer ticks
+constexpr uint32_t NS_TO_PULSE_TIMER_TICKS(uint32_t NS) { return (NS + (NS_PER_PULSE_TIMER_TICK) / 2) / (NS_PER_PULSE_TIMER_TICK); }
+
 #define TIMER_SETUP_NS (CYCLES_TO_NS(TIMER_READ_ADD_AND_STORE_CYCLES))
 
 #define PULSE_HIGH_TICK_COUNT hal_timer_t(NS_TO_PULSE_TIMER_TICKS(_MIN_PULSE_HIGH_NS - _MIN(_MIN_PULSE_HIGH_NS, TIMER_SETUP_NS)))
@@ -1398,6 +1405,9 @@ void Stepper::isr() {
   ENABLE_ISRS();
 }
 
+#define ISR_PULSE_CONTROL (MINIMUM_STEPPER_PULSE || MAXIMUM_STEPPER_RATE)
+#define ISR_MULTI_STEPS (ISR_PULSE_CONTROL && DISABLED(I2S_STEPPER_STREAM))
+
 /**
  * This phase of the ISR should ONLY create the pulses for the steppers.
  * This prevents jitter caused by the interval between the start of the
@@ -1428,9 +1438,11 @@ void Stepper::stepper_pulse_phase_isr() {
   step_events_completed += events_to_do;
 
   // Take multiple steps per interrupt (For high speed moves)
-  bool firstStep = true;
+  #if ISR_MULTI_STEPS
+    bool firstStep = true;
+    hal_timer_t end_tick_count = 0;
+  #endif
   xyze_bool_t step_needed{0};
-  hal_timer_t end_tick_count;
 
   do {
     #define _APPLY_STEP(AXIS) AXIS ##_APPLY_STEP
@@ -1487,7 +1499,7 @@ void Stepper::stepper_pulse_phase_isr() {
       PULSE_PREP(E);
     #endif
 
-    #if (MINIMUM_STEPPER_PULSE || MAXIMUM_STEPPER_RATE) && DISABLED(I2S_STEPPER_STREAM)
+    #if ISR_MULTI_STEPS
       if (firstStep)
         firstStep = false;
       else
@@ -1518,7 +1530,7 @@ void Stepper::stepper_pulse_phase_isr() {
     #endif
 
     // TODO: need to deal with MINIMUM_STEPPER_PULSE over i2s
-    #if (MINIMUM_STEPPER_PULSE || MAXIMUM_STEPPER_RATE) && DISABLED(I2S_STEPPER_STREAM)
+    #if ISR_MULTI_STEPS
       START_HIGH_PULSE();
       AWAIT_HIGH_PULSE();
     #endif
@@ -1551,7 +1563,7 @@ void Stepper::stepper_pulse_phase_isr() {
       #endif  // !MIXING_EXTRUDER
     #endif // !LIN_ADVANCE
 
-    #if (MINIMUM_STEPPER_PULSE || MAXIMUM_STEPPER_RATE) && DISABLED(I2S_STEPPER_STREAM)
+    #if ISR_MULTI_STEPS
       if (events_to_do) START_LOW_PULSE();
     #endif
 
@@ -1940,11 +1952,13 @@ uint32_t Stepper::stepper_block_phase_isr() {
     //const hal_timer_t added_step_ticks = hal_timer_t(ADDED_STEP_TICKS);
 
     // Step E stepper if we have steps
-    bool firstStep = true;
-    hal_timer_t end_tick_count;
+    #if ISR_MULTI_STEPS
+      bool firstStep = true;
+      hal_timer_t end_tick_count = 0;
+    #endif
 
     while (LA_steps) {
-      #if (MINIMUM_STEPPER_PULSE || MAXIMUM_STEPPER_RATE) && DISABLED(I2S_STEPPER_STREAM)
+      #if ISR_MULTI_STEPS
         if (firstStep)
           firstStep = false;
         else
@@ -1959,13 +1973,13 @@ uint32_t Stepper::stepper_block_phase_isr() {
       #endif
 
       // Enforce a minimum duration for STEP pulse ON
-      #if (MINIMUM_STEPPER_PULSE || MAXIMUM_STEPPER_RATE)
+      #if ISR_PULSE_CONTROL
         START_HIGH_PULSE();
       #endif
 
       LA_steps < 0 ? ++LA_steps : --LA_steps;
 
-      #if (MINIMUM_STEPPER_PULSE || MAXIMUM_STEPPER_RATE)
+      #if ISR_PULSE_CONTROL
         AWAIT_HIGH_PULSE();
       #endif
 
@@ -1978,7 +1992,7 @@ uint32_t Stepper::stepper_block_phase_isr() {
 
       // For minimum pulse time wait before looping
       // Just wait for the requested pulse duration
-      #if (MINIMUM_STEPPER_PULSE || MAXIMUM_STEPPER_RATE)
+      #if ISR_PULSE_CONTROL
         if (LA_steps) START_LOW_PULSE();
       #endif
     } // LA_steps
@@ -2269,7 +2283,7 @@ void Stepper::endstop_triggered(const AxisEnum axis) {
       (axis == CORE_AXIS_2
         ? CORESIGN(count_position[CORE_AXIS_1] - count_position[CORE_AXIS_2])
         : count_position[CORE_AXIS_1] + count_position[CORE_AXIS_2]
-      ) * 0.5f
+      ) * double(0.5)
     #else // !IS_CORE
       count_position[axis]
     #endif
